@@ -1,0 +1,79 @@
+---
+- name: Monitor MS SQL for High Blocked Processes
+  hosts: mssql_servers
+  gather_facts: no
+  tasks:
+    - name: Check if SQL Server is reachable
+      win_ping:
+      register: sql_server_ping
+      retries: 3
+      delay: 5
+      until: sql_server_ping.ping == 'pong'
+      ignore_errors: true
+
+    - name: Wait for 5 minutes if SQL Server is not reachable
+      pause:
+        minutes: 5
+      when: sql_server_ping.ping != 'pong'
+
+    - name: Check if SQL Server instance is running
+      win_service:
+        name: MSSQLSERVER
+        state: started
+      register: sql_service_status
+
+    - name: Capture SQL Server sessions if instance is running
+      block:
+        - name: Start SQL Server session capture (next 20 minutes, 5-minute intervals)
+          win_shell: |
+            sqlcmd -S {{ sql_server }} -d master -Q "SET NOCOUNT ON; 
+            DECLARE @start_time DATETIME = GETDATE();
+            DECLARE @end_time DATETIME = DATEADD(MINUTE, 20, @start_time);
+            WHILE GETDATE() < @end_time
+            BEGIN
+              PRINT 'Capturing SQL Sessions at ' + CONVERT(VARCHAR, GETDATE(), 120);
+              SELECT session_id, blocking_session_id, wait_type, wait_time
+              FROM sys.dm_exec_requests
+              WHERE blocking_session_id <> 0;
+              WAITFOR DELAY '00:05:00';  -- Wait 5 minutes before next capture
+            END"
+          register: session_capture_output
+
+        - name: Display session capture results
+          debug:
+            msg: "{{ session_capture_output.stdout }}"
+          
+    - name: Check if blocking count is less than 5
+      win_shell: |
+        sqlcmd -S {{ sql_server }} -d master -Q "
+        DECLARE @blocking_count INT;
+        SELECT @blocking_count = COUNT(*) 
+        FROM sys.dm_exec_requests
+        WHERE blocking_session_id <> 0;
+        SELECT @blocking_count AS blocking_count;"
+      register: blocking_count_output
+
+    - name: Check if blocking count is less than 5 and retrieve events
+      when: blocking_count_output.stdout | int < 5
+      block:
+        - name: Check for events in Extended Session Management (ESM)
+          win_shell: |
+            sqlcmd -S {{ sql_server }} -d master -Q "
+            SELECT event_id, event_description
+            FROM sys.dm_xe_sessions
+            WHERE state_desc = 'STARTED';"
+          register: esm_events
+
+        - name: Display ESM event messages
+          debug:
+            msg: "ESM Event Cleared: {{ esm_events.stdout }}"
+      
+    - name: Display a message if blocking count is high or no events in ESM
+      when: blocking_count_output.stdout | int >= 5
+      debug:
+        msg: "Blocking count is high or ESM events are not cleared. Further investigation needed."
+
+    - name: Display message if SQL Server instance is not running
+      when: sql_service_status.state != 'started'
+      debug:
+        msg: "SQL Server instance is not running. Please start the SQL Server service."
