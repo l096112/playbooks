@@ -1,0 +1,175 @@
+---
+- name: Monitor MS SQL for High Blocked Processes and Integrate with ServiceNow
+  hosts: mssql_servers
+  gather_facts: no
+  #vars:
+   # servicenow_url: "https://your_instance.service-now.com/api/now/table/incident"
+   # servicenow_user: "your_servicenow_user"
+   # servicenow_password: "your_servicenow_password"
+   # incident_state_assigned: "2"  # Incident state for assigned
+   # incident_state_resolved: "6"  # Incident state for resolved
+   # incident_queue_automation_team: "automation team"
+   # incident_queue_sql_support: "DATABASE-SQLSERVER-GLB"
+
+  tasks:
+    # Step 1: Query ServiceNow for existing incidents related to high SQL blocked processes
+   # - name: Query ServiceNow for open incidents related to high SQL blocked processes
+   #   uri:
+   #     url: "{{ servicenow_url }}?sysparm_query=short_descriptionLIKE'High SQL Blocked Processes'&sysparm_limit=1"
+   #     user: "{{ servicenow_user }}"
+   #     password: "{{ servicenow_password }}"
+   #     headers:
+   #       Accept: "application/json"
+   #     method: GET
+   #     status_code: 200
+   #   register: incident_search
+   #   ignore_errors: true
+
+   # - name: Display incident search result
+   #   debug:
+   #     msg: "Incident search result: {{ incident_search.json.result }}"
+
+  #  - name: Set incident ID if incident found
+  #    set_fact:
+  #      incident_id: "{{ incident_search.json.result[0].sys_id if incident_search.json.result | length > 0 else '' }}"
+
+    # Step 2: If no incident found, stop the playbook
+ #   - name: Stop playbook if no incident found
+ #     debug:
+ #       msg: "No existing incident found for High SQL Blocked Processes. Exiting."
+ #     when: incident_id == ''
+ #     fail: true
+
+    # Step 3: Assign the incident to "automation team" queue
+ #   - name: Assign incident to automation team queue
+ #     uri:
+ #       url: "https://your_instance.service-now.com/api/now/table/incident/{{ incident_id }}"
+ #       user: "{{ servicenow_user }}"
+ #       password: "{{ servicenow_password }}"
+ #       headers:
+ #         Content-Type: "application/json"
+ #       method: PATCH
+ #       body: |
+ #         {
+ #           "assigned_to": "{{ incident_queue_automation_team }}",
+ #           "state": "{{ incident_state_assigned }}"
+ #         }
+ #       body_format: json
+ #       status_code: 200
+ #     register: assign_incident_result
+
+ #   - name: Display incident assignment result
+ #     debug:
+ #       msg: "Incident assignment result: {{ assign_incident_result.json }}"
+
+    # Step 4: Check if SQL Server is reachable
+    - name: Check if SQL Server is reachable
+      win_ping:
+      register: sql_server_ping
+      retries: 3
+      delay: 5
+      until: sql_server_ping.ping == 'pong'
+      ignore_errors: true
+
+    - name: Display SQL Server reachability result
+      debug:
+        msg: "SQL Server ping result: {{ sql_server_ping.ping }}"
+
+    - name: Wait for 5 minutes if SQL Server is not reachable
+      pause:
+        minutes: 5
+      when: sql_server_ping.ping != 'pong'
+
+#    - name: Update incident work log if SQL Server is still unreachable
+#      when: sql_server_ping.ping != 'pong'
+#      uri:
+#        url: "https://your_instance.service-now.com/api/now/table/incident/{{ incident_id }}"
+#        user: "{{ servicenow_user }}"
+#        password: "{{ servicenow_password }}"
+#        headers:
+#          Content-Type: "application/json"
+#        method: PATCH
+#        body: |
+#          {
+#            "work_notes": "SQL Server is not reachable after waiting for 5 minutes. Re-assigning to SQL support team.",
+#            "assigned_to": "{{ incident_queue_sql_support }}"
+#          }
+#        body_format: json
+#        status_code: 200
+#      register: update_incident_result
+
+#    - name: Display SQL Server unreachable update result
+#      debug:
+#        msg: "Incident update result for SQL Server unreachable: {{ update_incident_result.json }}"
+
+    # Step 5: Check if SQL Server instance is running
+    - name: Check if SQL Server instance is running
+      win_service:
+        name: MSSQLSERVER
+        state: started
+      register: sql_service_status
+
+    - name: Display SQL Server service status
+      debug:
+        msg: "SQL Server service status: {{ sql_service_status.state }}"
+
+#    - name: Update incident work log if SQL Server instance is not running
+#      when: sql_service_status.state != 'started'
+#      uri:
+#        url: "https://your_instance.service-now.com/api/now/table/incident/{{ incident_id }}"
+#        user: "{{ servicenow_user }}"
+#        password: "{{ servicenow_password }}"
+#        headers:
+#          Content-Type: "application/json"
+#        method: PATCH
+#        body: |
+#          {
+#            "work_notes": "SQL Server instance is not running. Re-assigning to SQL support team.",
+#            "assigned_to": "{{ incident_queue_sql_support }}"
+#          }
+#        body_format: json
+#        status_code: 200
+#      register: update_sql_service_status_result
+
+#    - name: Display SQL Server instance update result
+#      debug:
+#        msg: "Incident update result for SQL Server instance not running: {{ update_sql_service_status_result.json }}"
+
+    # Step 6: Capture SQL Server sessions for 20 minutes
+    - name: Capture SQL Server sessions for the next 20 minutes with 5-minute intervals
+      win_shell: |
+        sqlcmd -S {{ inventory_hostname }} -d master -Q "SET NOCOUNT ON;
+        DECLARE @start_time DATETIME = GETDATE();
+        DECLARE @end_time DATETIME = DATEADD(MINUTE, 20, @start_time);
+        WHILE GETDATE() < @end_time
+        BEGIN
+          PRINT 'Capturing SQL Sessions at ' + CONVERT(VARCHAR, GETDATE(), 120);
+          SELECT session_id, blocking_session_id, wait_type, wait_time
+          FROM sys.dm_exec_requests
+          WHERE blocking_session_id <> 0;
+          WAITFOR DELAY '00:05:00';  -- Wait 5 minutes before next capture
+        END"
+      register: session_capture_output
+
+    - name: Display SQL Server session capture output
+      debug:
+        msg: "SQL Server session capture output: {{ session_capture_output.stdout }}"
+
+    - name: Check if blocking count is less than 5
+      win_shell: |
+        sqlcmd -S {{ inventory_hostname }} -d master -Q "
+        DECLARE @blocking_count INT;
+        SELECT @blocking_count = COUNT(*) 
+        FROM sys.dm_exec_requests
+        WHERE blocking_session_id <> 0;
+        SELECT @blocking_count AS blocking_count;"
+      register: blocking_count_output
+
+    - name: Display blocking count result
+      debug:
+        msg: "Blocking count result: {{ blocking_count_output.stdout }}"
+
+#    - name: Update incident work log and re-assign if blocking count is high
+#      when: blocking_count_output.stdout | int >= 5
+#      uri:
+#        url: "https://your_instance.service-now.com/api/now/table/_
